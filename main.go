@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"syscall"
+	"time"
 
 	logrus "github.com/sirupsen/logrus"
 
@@ -43,6 +45,26 @@ var (
 	dataset = os.Getenv("LIBHONEY_DATASET")
 	apiHost = os.Getenv("LIBHONEY_API_HOST")
 	debug   = envOrElseBool("HONEYCOMB_DEBUG", false)
+
+	// libhoney http client/transport configuration settings
+	// https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/#clienttimeouts
+	defaultHttpClientTimeout             = time.Second * 15
+	defaultHttpTransportDialerTimeout    = time.Second * 5
+	defaultHttpTransportDialerKeepAlive  = time.Second * 10
+	defaultHttpClientTLSHandshakeTimeout = time.Second * 5
+
+	libhoneyHttpClientTimeout = envOrElseDuration(
+		"LIBHONEY_HTTP_CLIENT_TIMEOUT_S",
+		defaultHttpClientTimeout)
+	libhoneyHttpTransportDialerTimeout = envOrElseDuration(
+		"LIBHONEY_HTTP_TRANSPORT_DIALER_TIMEOUT_S",
+		defaultHttpTransportDialerTimeout)
+	libhoneyHttpTransportDialerKeepAlive = envOrElseDuration(
+		"LIBHONEY_HTTP_TRANSPORT_DIALER_KEEP_ALIVE_S",
+		defaultHttpTransportDialerKeepAlive)
+	libhoneyHttpTransportTLSHandshakeTimeout = envOrElseDuration(
+		"LIBHONEY_HTTP_TRANSPORT_TLS_HANDSHAKE_TIMEOUT_S",
+		defaultHttpClientTLSHandshakeTimeout)
 
 	// when run in local mode, we don't attempt to register the extension or subscribe
 	// to log events - useful for testing
@@ -139,6 +161,18 @@ func libhoneyConfig() libhoney.ClientConfig {
 	}
 	userAgent := fmt.Sprintf("honeycomb-lambda-extension-%s/%s", runtime.GOARCH, version)
 
+	// libhoneyHttpTransport uses settings from http.DefaultTransport as starting point, but
+	// overrides with shorter timeouts more suitable for a Lambda extension. Reducing
+	// timeout durations here helps decrease impact to the running function when network
+	// connectivity events occur, which otherwise would result in extending the function runtime
+	// or causing function timeouts.
+	libhoneyHttpTransport := http.DefaultTransport.(*http.Transport).Clone()
+	libhoneyHttpTransport.DialContext = (&net.Dialer{
+		Timeout:   libhoneyHttpTransportDialerTimeout,
+		KeepAlive: libhoneyHttpTransportDialerKeepAlive,
+	}).DialContext
+	libhoneyHttpTransport.TLSHandshakeTimeout = libhoneyHttpTransportTLSHandshakeTimeout
+
 	return libhoney.ClientConfig{
 		APIKey:  apiKey,
 		Dataset: dataset,
@@ -150,6 +184,8 @@ func libhoneyConfig() libhoney.ClientConfig {
 			PendingWorkCapacity:   libhoney.DefaultPendingWorkCapacity,
 			UserAgentAddition:     userAgent,
 			EnableMsgpackEncoding: true,
+			Transport:             libhoneyHttpTransport,
+			HttpClientTimeout:     libhoneyHttpClientTimeout,
 		},
 	}
 }
@@ -173,6 +209,17 @@ func envOrElseBool(key string, fallback bool) bool {
 			return fallback
 		}
 		return v
+	}
+	return fallback
+}
+
+func envOrElseDuration(key string, fallback time.Duration) time.Duration {
+	if value, ok := os.LookupEnv(key); ok {
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fallback
+		}
+		return time.Duration(v) * time.Second
 	}
 	return fallback
 }
