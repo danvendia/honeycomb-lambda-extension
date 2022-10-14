@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,10 +24,18 @@ import (
 )
 
 const (
-	// Waiting too long to send a batch of events can be
-	// expensive in Lambda. It's reasonable to expect a
-	// batch send to complete in this amount of time.
+	// defaultBatchSendTimeout is the default timeout for a batch send to complete end to end.
+	// This value ends up being used as the underlying libhoney-go HTTP client timeout. There
+	// is a built in retry in libhoney-go which means the overall batch send timeout
+	// is really 2x this value. Caution should be exercised when setting a lower value for this as
+	// it's possible that a large batch may not be able to complete in the allotted time.
 	defaultBatchSendTimeout = time.Second * 15
+
+	// defaultConnectTimeout is the default timeout waiting for a connection to initiate. This value ends
+	// up being used as the Dial timeout for the underlying libhoney-go HTTP client. This setting
+	// is critical to help reduce impact caused by connectivity issues as it allows us to
+	// fail fast and not have to wait for the much longer HTTP client timeout to occur
+	defaultConnectTimeout = time.Second * 3
 )
 
 var (
@@ -162,17 +171,24 @@ func libhoneyConfig() libhoney.ClientConfig {
 
 func newTransmission() *transmission.Honeycomb {
 	batchSendTimeout := envOrElseDuration("HONEYCOMB_BATCH_SEND_TIMEOUT", defaultBatchSendTimeout)
+	connectTimeout := envOrElseDuration("HONEYCOMB_CONNECT_TIMEOUT", defaultConnectTimeout)
 
-	userAgent := fmt.Sprintf("honeycomb-lambda-extension/%s (%s)", version, runtime.GOARCH)
+	// httpTransport uses settings from http.DefaultTransport as starting point, but
+	// overrides the dialer connect timeout
+	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
+	httpTransport.DialContext = (&net.Dialer{
+		Timeout: connectTimeout,
+	}).DialContext
 
 	return &transmission.Honeycomb{
 		MaxBatchSize:          libhoney.DefaultMaxBatchSize,
 		BatchTimeout:          libhoney.DefaultBatchTimeout,
 		MaxConcurrentBatches:  libhoney.DefaultMaxConcurrentBatches,
 		PendingWorkCapacity:   libhoney.DefaultPendingWorkCapacity,
-		UserAgentAddition:     userAgent,
+		UserAgentAddition:     fmt.Sprintf("honeycomb-lambda-extension-%s/%s", runtime.GOARCH, version),
 		EnableMsgpackEncoding: true,
 		BatchSendTimeout:      batchSendTimeout,
+		Transport:             httpTransport,
 	}
 }
 
